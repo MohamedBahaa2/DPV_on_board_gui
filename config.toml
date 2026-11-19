@@ -1,0 +1,46 @@
+# DPV dashboard configuration.
+# Edit and restart the dashboard (pkill -f dpv_dash; the launcher restarts it).
+
+[mavlink]
+# Pixhawk on USB. Globs are allowed: the first match is used, so the stable
+# /dev/serial/by-id name works even if ttyACM numbering changes. "-if00" is the
+# MAVLink interface (some boards also expose a second CAN/SLCAN interface).
+# Run `ls /dev/serial/by-id/` with the Pixhawk plugged in to see its exact name.
+# For a SITL/laptop test use e.g. "udpin:0.0.0.0:14550".
+connection = ["/dev/serial/by-id/usb-*-if00", "/dev/ttyACM0"]
+baud = 115200                   # ignored by USB, kept for a UART fallback
+# ArduPilot only accepts RC overrides from the sysid in its SYSID_MYGCS param.
+source_system = 255
+source_component = 191          # MAV_COMP_ID_ONBOARD_COMPUTER
+link_timeout_s = 2.0            # no heartbeat for this long => NO LINK
+
+[buttons]
+# BCM GPIO numbers (not physical pin numbers). Avoid 14/15 (UART).
+mode = 5        # physical pin 29
+speed = 6       # physical pin 31
+trigger = 13    # physical pin 33
+guide = 19      # physical pin 35
+# Most hall switches (A3144, US5881, ...) are open-drain and pull the line LOW
+# when a magnet is present: active_high = false enables the Pi's internal pull-up.
+# Set true if your sensor actively drives the line HIGH when pressed.
+active_high = false
+bounce_time = 0.03              # seconds
+
+[speed]
+levels = [25, 50, 75, 100]      # percent; SPEED button cycles through these
+default_index = 0
+
+[throttle]
+enabled = true                  # false = never send RC overrides (display-only bench mode)
+channel = 3                     # RC input channel ArduPilot uses for throttle (RCMAP_THROTTLE)
+neutral_pwm = 1500              # motor stopped
+full_pwm = 2000                 # 100% forward
+rate_hz = 10
+
+[modes]
+cycle = ["MANUAL", "AUTO", "RTL"]
+commit_delay_s = 1.5            # pending mode is sent after this long without another press
+
+[display]
+speed_units = "kn"              # "kn", "m/s" or "km/h"
+fullscreen = true

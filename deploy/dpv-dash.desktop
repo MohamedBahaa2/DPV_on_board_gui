@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=DPV Dashboard
+Comment=Driver HUD for the DPV (starts full screen at login)
+Exec=/home/dpv/dpv_gui/scripts/run.sh
+Terminal=false
+X-GNOME-Autostart-enabled=true
