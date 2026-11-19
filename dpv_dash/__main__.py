@@ -3,12 +3,33 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import sys
 import tomllib
 from pathlib import Path
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "config.toml"
+
+
+def use_local_display() -> None:
+    """When started from SSH (no display variables), draw on the Pi's own screen.
+
+    The desktop is a Wayland session (labwc) whose socket lives in
+    /run/user/<uid>/. Without this, Qt falls back to X11 and fails with
+    'could not connect to display'.
+    """
+    if os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"):
+        os.environ.setdefault("QT_QPA_PLATFORM", "wayland" if os.environ.get("WAYLAND_DISPLAY") else "xcb")
+        return
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    sockets = sorted(Path(runtime).glob("wayland-[0-9]")) if Path(runtime).is_dir() else []
+    if not sockets:
+        sys.exit("No desktop session found on this Pi's screen (is the desktop logged in?).\n"
+                 f"Looked for a Wayland socket in {runtime}.")
+    os.environ["XDG_RUNTIME_DIR"] = runtime
+    os.environ["WAYLAND_DISPLAY"] = sockets[0].name
+    os.environ["QT_QPA_PLATFORM"] = "wayland"
 
 
 def main() -> int:
@@ -31,6 +52,7 @@ def main() -> int:
         test_buttons(cfg["buttons"])
         return 0
 
+    use_local_display()
     from PyQt5.QtCore import QTimer
     from PyQt5.QtWidgets import QApplication
 

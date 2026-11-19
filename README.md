@@ -149,20 +149,14 @@ pkill -f scripts/run.sh; pkill -f "python -m dpv_dash"
 
 ### Step 2: start it
 
-**From a terminal on the Pi's own screen** (keyboard plugged into the Pi):
+From a terminal on the Pi or from an SSH session (either way, it appears on the LCD):
 
 ```bash
 .venv/bin/python -m dpv_dash --sim        # sim mode
 .venv/bin/python -m dpv_dash              # operation mode (Pixhawk on USB)
 ```
 
-**From an SSH session** (it still appears on the LCD):
-
-```bash
-export XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 QT_QPA_PLATFORM=wayland
-.venv/bin/python -m dpv_dash --sim        # sim mode
-.venv/bin/python -m dpv_dash              # operation mode
-```
+Over SSH the app finds the Pi's desktop session on its own. The desktop must be logged in, which happens automatically at boot.
 
 Useful options (they work in both modes):
 
@@ -192,12 +186,12 @@ In operation mode, the dashboard shows **NO LINK** until the Pixhawk is plugged 
 Reboot, or start the autostart launcher again. The launcher always runs operation mode, full screen, and restarts it if it crashes:
 
 ```bash
-XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 nohup scripts/run.sh >/dev/null 2>&1 &
+nohup scripts/run.sh >/dev/null 2>&1 &
 ```
 
 ## 9. Development
 
-To take a screenshot of the LCD (over SSH, with the `export` line above): `grim shot.png`. The log of the autostarted dashboard is at `~/.local/state/dpv_dash.log`.
+To take a screenshot of the LCD over SSH: `XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 grim shot.png`. The log of the autostarted dashboard is at `~/.local/state/dpv_dash.log`.
 
 **`config.toml`**: the Pixhawk device (a path, glob or list), button pins and polarity, speed levels, throttle channel and PWM range, the mode cycle and its commit delay, and the speed units (`kn`, `m/s` or `km/h`).
 
