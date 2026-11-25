@@ -7,7 +7,7 @@ import random
 import threading
 import time
 
-from .state import VehicleState, bearing_distance
+from .state import STALE_S, VehicleState, apply_trust, bearing_distance
 
 HOME = (30.0444, 31.2357)
 WAYPOINTS = [(30.0460, 31.2380), (30.0475, 31.2350), (30.0450, 31.2330)]
@@ -15,12 +15,15 @@ SIM_CRUISE = 1.5  # m/s
 
 
 class SimLink:
-    def __init__(self, cfg: dict | None = None, rate_hz: float = 20.0):
+    def __init__(self, battery_cfg: dict | None = None, rate_hz: float = 20.0):
+        self._min_valid_v = (battery_cfg or {}).get("min_valid_v", 6.0)
         self._s = VehicleState(link_ok=True, mode="MANUAL", armed=True,
                                batt_voltage=16.6, batt_current=0.0, batt_remaining=100,
                                gps_fix=3, gps_sats=14, lat=HOME[0], lon=HOME[1],
                                home_lat=HOME[0], home_lon=HOME[1], wp_seq=1,
-                               cruise_speed=SIM_CRUISE, heading=40.0,
+                               cruise_speed=SIM_CRUISE, heading=40.0, groundspeed=0.0,
+                               throttle_pct=0, roll=0.0, pitch=0.0, ahrs_ok=True,
+                               batt_monitor=4, batt_present=True,
                                mission={i + 1: wp for i, wp in enumerate(WAYPOINTS)})
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -39,7 +42,9 @@ class SimLink:
 
     def snapshot(self) -> VehicleState:
         with self._lock:
-            return copy.copy(self._s)
+            s = copy.copy(self._s)
+            s.rx = dict(s.rx)
+        return apply_trust(s, self._min_valid_v)  # same rules as the real link
 
     def set_mode(self, name: str):
         def later():
@@ -73,6 +78,8 @@ class SimLink:
 
     def _step(self, t: float):
         s, dt = self._s, self._dt
+        now = time.monotonic()
+        s.rx = {msg: now for msg in STALE_S}  # every simulated "message" is fresh
         if time.monotonic() - self._throttle_time > 0.5:  # mimic RC_OVERRIDE_TIME
             self._throttle = 0.0
         if s.mode == "MANUAL":

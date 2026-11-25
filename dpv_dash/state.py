@@ -6,25 +6,47 @@ import time
 from dataclasses import dataclass, field
 
 
+# How long a value may go without being refreshed before the HUD stops trusting
+# it (seconds). Roughly 3-10x the stream period requested in mavlink_link.py.
+STALE_S = {
+    "VFR_HUD": 1.0,
+    "ATTITUDE": 1.0,
+    "GLOBAL_POSITION_INT": 2.0,
+    "SYS_STATUS": 3.0,
+    "GPS_RAW_INT": 3.0,
+}
+TILT_WARN_DEG = 70.0  # beyond this roll/pitch the compass heading is unreliable
+
+
 @dataclass
 class VehicleState:
-    """Latest telemetry from the Pixhawk. Written by the link thread, read by the HUD."""
+    """Latest telemetry from the Pixhawk. Written by the link thread, read by the HUD.
+
+    `None` always means "unknown / not trustworthy right now": the HUD draws it
+    as dashes. Values are never invented. `apply_trust()` turns the raw state
+    into what may be displayed.
+    """
     link_ok: bool = False
     mode: str = "----"
-    armed: bool = False
+    armed: bool | None = None
 
-    groundspeed: float = 0.0          # m/s
-    heading: float = 0.0              # deg, compass
-    throttle_pct: int = 0
-    roll: float = 0.0                 # rad
-    pitch: float = 0.0                # rad
+    groundspeed: float | None = None  # m/s (only with a 3D GPS fix)
+    heading: float | None = None      # deg, compass
+    heading_warn: str = ""            # "" ok, "AHRS" = AHRS unhealthy, "TILT" = near-vertical
+    throttle_pct: int | None = None
+    roll: float | None = None         # rad
+    pitch: float | None = None        # rad
+    ahrs_ok: bool | None = None       # SYS_STATUS AHRS health bit
 
+    batt_status: str = "--"           # "OK", "NO MON" (no monitor), "NO BATT" (implausible V), "--" (no data)
+    batt_monitor: int | None = None   # BATT_MONITOR param
+    batt_present: bool | None = None  # SYS_STATUS battery sensor bit
     batt_voltage: float | None = None  # V
     batt_current: float | None = None  # A
-    batt_remaining: int | None = None  # %
+    batt_remaining: int | None = None  # % (ArduPilot counts it down from BATT_CAPACITY since FC boot)
 
-    gps_fix: int = 0                  # 0-1 none, 2 = 2D, 3 = 3D, 4+ = DGPS/RTK
-    gps_sats: int = 0
+    gps_fix: int | None = None        # 0 no GPS, 1 no fix, 2 = 2D, 3 = 3D, 4+ = DGPS/RTK
+    gps_sats: int | None = None
     lat: float | None = None
     lon: float | None = None
     home_lat: float | None = None
@@ -43,6 +65,9 @@ class VehicleState:
     statustext: str = ""
     statustext_severity: int = 6
     statustext_time: float = 0.0
+
+    # message type -> monotonic time it was last received
+    rx: dict = field(default_factory=dict)
 
     def home_bearing_distance(self) -> tuple[float, float] | None:
         if None in (self.lat, self.lon, self.home_lat, self.home_lon):
@@ -76,6 +101,51 @@ class UiState:
     @property
     def speed_pct(self) -> int:
         return self.speed_levels[self.speed_index]
+
+
+def apply_trust(s: VehicleState, min_valid_v: float = 6.0, now: float | None = None) -> VehicleState:
+    """Blank every value that is stale, missing or physically implausible.
+
+    Called on a *copy* (a snapshot) by the link, so the HUD, controller and
+    blackbox all see the same trusted values. Returns `s` for convenience.
+    """
+    now = time.monotonic() if now is None else now
+
+    def fresh(msg: str) -> bool:
+        return s.link_ok and now - s.rx.get(msg, -1e9) < STALE_S[msg]
+
+    if not s.link_ok:
+        s.mode, s.armed = "----", None
+    if not fresh("VFR_HUD"):
+        s.groundspeed = s.heading = s.throttle_pct = None
+    if not fresh("ATTITUDE"):
+        s.roll = s.pitch = None
+    if not fresh("GPS_RAW_INT"):
+        s.gps_fix = s.gps_sats = None
+    has_fix = s.gps_fix is not None and s.gps_fix >= 3
+    if not has_fix:
+        s.groundspeed = None          # without GPS this is an EKF guess, not a measurement
+    if not (has_fix and fresh("GLOBAL_POSITION_INT")):
+        s.lat = s.lon = None
+
+    s.heading_warn = ""
+    if s.heading is not None:
+        if s.roll is not None and max(abs(math.degrees(s.roll)), abs(math.degrees(s.pitch))) > TILT_WARN_DEG:
+            s.heading_warn = "TILT"
+        elif s.ahrs_ok is False:
+            s.heading_warn = "AHRS"
+
+    if not fresh("SYS_STATUS"):
+        s.batt_status = "--"
+    elif s.batt_monitor == 0 or s.batt_present is False:
+        s.batt_status = "NO MON"
+    elif s.batt_voltage is None or s.batt_voltage < min_valid_v:
+        s.batt_status = "NO BATT"     # monitor configured but nothing (real) connected
+    else:
+        s.batt_status = "OK"
+    if s.batt_status != "OK":
+        s.batt_voltage = s.batt_current = s.batt_remaining = None
+    return s
 
 
 def bearing_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> tuple[float, float]:

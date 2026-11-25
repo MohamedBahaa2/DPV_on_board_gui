@@ -2,6 +2,9 @@
 
 Everything is drawn in a fixed 800x480 logical canvas (the LCD's native size)
 and scaled to fit the window, so --windowed on a desktop looks the same.
+
+The HUD never invents a value: whatever the trusted snapshot has as `None`
+(stale, missing, implausible) is drawn as grey dashes.
 """
 from __future__ import annotations
 
@@ -157,6 +160,8 @@ class Hud(QWidget):
 
     # -- attitude: faint horizon behind the centre area
     def draw_horizon(self, p, s):
+        if s.roll is None or s.pitch is None:
+            return
         p.save()
         p.setClipRect(QRectF(110, 72, 580, 330))
         p.translate(400, 210)
@@ -175,6 +180,13 @@ class Hud(QWidget):
     # -- heading tape across the top, with guidance bug
     def draw_heading_tape(self, p, s, g: Guide):
         x0, x1, y0, y1, cx, ppd = 110.0, 690.0, 0.0, 64.0, 400.0, 4.5
+        if s.heading is None:  # no (fresh) heading: empty tape, dashes
+            p.fillRect(QRectF(x0, y0, x1 - x0, y1 - y0), PANEL)
+            p.setPen(QPen(GREEN_DIM, 1))
+            p.drawRect(QRectF(x0, y0, x1 - x0, y1 - y0))
+            self.box(p, (cx - 46, 0, 92, 38), GREY, BG)
+            self.text(p, (cx - 46, 0, 92, 38), "---°", GREY, 28)
+            return
         hdg = s.heading % 360
         p.save()
         p.setClipRect(QRectF(x0, y0, x1 - x0, y1 - y0))
@@ -210,11 +222,14 @@ class Hud(QWidget):
         p.restore()
         p.setPen(QPen(GREEN_DIM, 1))
         p.drawRect(QRectF(x0, y0, x1 - x0, y1 - y0))
-        # current heading readout
-        self.box(p, (cx - 46, 0, 92, 38), GREEN, BG)
-        self.text(p, (cx - 46, 0, 92, 38), f"{round(hdg) % 360:03d}°", GREEN, 28)
+        # current heading readout (amber + reason when the AHRS can't vouch for it)
+        hc = AMBER if s.heading_warn else GREEN
+        self.box(p, (cx - 46, 0, 92, 38), hc, BG)
+        self.text(p, (cx - 46, 0, 92, 38), f"{round(hdg) % 360:03d}°", hc, 28)
+        if s.heading_warn:
+            self.text(p, (cx + 48, 2, 60, 18), s.heading_warn, AMBER, 14, Qt.AlignLeft | Qt.AlignVCenter)
         p.setPen(Qt.NoPen)
-        p.setBrush(GREEN)
+        p.setBrush(hc)
         p.drawPolygon(QPolygonF([QPointF(cx - 7, 38), QPointF(cx + 7, 38), QPointF(cx, 47)]))
         p.setBrush(Qt.NoBrush)
 
@@ -223,14 +238,15 @@ class Hud(QWidget):
         factor, label, ppu, step = UNITS[self.units]
         x, y, w, h = 0.0, 72.0, 104.0, 330.0
         cy = y + h / 2
-        v = s.groundspeed * factor
+        known = s.groundspeed is not None
+        v = s.groundspeed * factor if known else 0.0
         p.save()
         p.setClipRect(QRectF(x, y, w, h))
         p.fillRect(QRectF(x, y, w, h), PANEL)
         minor = step / 2
         i0 = math.floor((v - h / 2 / ppu) / minor)
         i1 = math.ceil((v + h / 2 / ppu) / minor)
-        for i in range(max(0, i0), i1 + 1):
+        for i in (range(max(0, i0), i1 + 1) if known else ()):
             val = i * minor
             ty = cy - (val - v) * ppu
             major = i % 2 == 0
@@ -239,7 +255,7 @@ class Hud(QWidget):
             if major:
                 self.text(p, (x, ty - 11, w - 26, 22), f"{val:g}", GREEN, 18, Qt.AlignRight | Qt.AlignVCenter)
         # target-speed bug in AUTO/RTL (level% of WP_SPEED)
-        if s.mode in ("AUTO", "RTL") and s.cruise_speed:
+        if known and s.mode in ("AUTO", "RTL") and s.cruise_speed:
             tv = s.cruise_speed * ui.speed_pct / 100.0 * factor
             ty = cy - (tv - v) * ppu
             p.setPen(QPen(MAGENTA, 3))
@@ -263,11 +279,14 @@ class Hud(QWidget):
         path.lineTo(84, cy + 24)
         path.lineTo(2, cy + 24)
         path.closeSubpath()
-        p.setPen(QPen(GREEN, 2))
+        col = GREEN if known else GREY
+        p.setPen(QPen(col, 2))
         p.setBrush(BG)
         p.drawPath(path)
         p.setBrush(Qt.NoBrush)
-        self.text(p, (2, cy - 24, 82, 48), f"{v:.1f}", GREEN, 32)
+        self.text(p, (2, cy - 24, 82, 48), f"{v:.1f}" if known else "--.-", col, 32)
+        if not known and s.link_ok:
+            self.text(p, (x, cy + 30, w, 20), "NEEDS GPS", GREY, 13, bold=False)
 
     # -- battery column on the right
     def draw_battery(self, p, s):
@@ -285,7 +304,11 @@ class Hud(QWidget):
         if pct is not None:
             fh = (bh - 6) * max(0, min(100, pct)) / 100.0
             p.fillRect(QRectF(bx + 3, by + bh - 3 - fh, bw - 6, fh), col)
-        self.text(p, (x, by + bh + 4, w, 36), "--%" if pct is None else f"{pct}%", col, 30)
+        if pct is not None:
+            self.text(p, (x, by + bh + 4, w, 36), f"{pct}%", col, 30)
+        else:  # "NO BATT" / "NO MON" / "--": say why there is no number
+            self.text(p, (x, by + bh + 4, w, 36), "--%" if s.batt_status in ("--", "OK") else s.batt_status,
+                      GREY, 30 if s.batt_status in ("--", "OK") else 20)
         vtxt = "--.-V" if s.batt_voltage is None else f"{s.batt_voltage:.1f}V"
         atxt = "--.-A" if s.batt_current is None else f"{s.batt_current:.1f}A"
         self.text(p, (x, by + bh + 42, w, 24), vtxt, WHITE, 20)
@@ -295,11 +318,17 @@ class Hud(QWidget):
     def draw_steer_cue(self, p, s, g: Guide):
         cx, cy = 400.0, 168.0
         if g.bearing is None:
-            msg = "NO HOME POSITION" if g.label == "HOME" else "NO ACTIVE WAYPOINT"
+            if s.lat is None and (g.label == "HOME" or not s.mission):
+                msg = "NO GPS POSITION"
+            else:
+                msg = "NO HOME POSITION" if g.label == "HOME" else "NO ACTIVE WAYPOINT"
             self.text(p, (150, cy - 20, 500, 40), msg, GREY, 22)
             return
         if g.distance is not None and g.distance < ARRIVED_M:
             self.text(p, (150, cy - 26, 500, 52), f"AT {g.label}", g.color, 40)
+            return
+        if s.heading is None:
+            self.text(p, (150, cy - 20, 500, 40), "NO HEADING", GREY, 22)
             return
         err = wrap180(g.bearing - s.heading)
         if abs(err) < 5:
@@ -336,7 +365,7 @@ class Hud(QWidget):
         self.text(p, (x + 12, y + 46, w - 24, 26), coords, WHITE if g.coords else GREY, 19,
                   Qt.AlignLeft | Qt.AlignVCenter, bold=False)
         # ETA, and which guidance source is selected (GUIDE button toggles)
-        if g.distance is not None and s.groundspeed > 0.2:
+        if g.distance is not None and s.groundspeed is not None and s.groundspeed > 0.2:
             eta = int(g.distance / s.groundspeed)
             eta_txt = f"ETA {eta // 60:d}:{eta % 60:02d}" if eta < 6000 else "ETA --:--"
         else:
@@ -390,16 +419,24 @@ class Hud(QWidget):
                 p.drawRect(r)
         self.text(p, (330, y + 20, 68, 44), f"{ui.speed_pct}%", CYAN, 26, Qt.AlignRight | Qt.AlignVCenter)
         # small status boxes
-        boxes = [
-            ("MOTOR", "ARMED" if s.armed else "SAFE", RED if s.armed else GREEN, False),
-            ("THR", f"{s.throttle_pct}%", BG if ui.trigger_held else GREEN, ui.trigger_held),
-        ]
-        if s.gps_fix >= 3:
-            boxes.append(("GPS", f"{'3D' if s.gps_fix == 3 else 'RTK' if s.gps_fix >= 5 else 'DGPS'} {s.gps_sats}", GREEN, False))
-        elif s.gps_fix == 2:
-            boxes.append(("GPS", f"2D {s.gps_sats}", AMBER, False))
+        if s.armed is None:
+            motor = ("MOTOR", "--", GREY, False)
         else:
+            motor = ("MOTOR", "ARMED" if s.armed else "SAFE", RED if s.armed else GREEN, False)
+        thr = "--" if s.throttle_pct is None else f"{s.throttle_pct}%"
+        boxes = [motor, ("THR", thr, BG if ui.trigger_held else GREEN if s.throttle_pct is not None else GREY,
+                         ui.trigger_held)]
+        sats = "" if s.gps_sats is None else f" {s.gps_sats}"
+        if s.gps_fix is None:
+            boxes.append(("GPS", "--", GREY, False))
+        elif s.gps_fix >= 3:
+            boxes.append(("GPS", f"{'3D' if s.gps_fix == 3 else 'RTK' if s.gps_fix >= 5 else 'DGPS'}{sats}", GREEN, False))
+        elif s.gps_fix == 2:
+            boxes.append(("GPS", f"2D{sats}", AMBER, False))
+        elif s.gps_fix == 1:
             boxes.append(("GPS", "NO FIX", RED, False))
+        else:
+            boxes.append(("GPS", "NO GPS", RED, False))
         boxes.append(("LINK", "OK" if s.link_ok else "LOST", GREEN if s.link_ok else RED, False))
         bx = 408.0
         bw = (W - bx) / len(boxes)
