@@ -26,6 +26,18 @@ guide = 19      # physical pin 35
 active_high = false
 bounce_time = 0.03              # seconds
 
+[battery]
+# Below this voltage the pack is treated as "not connected" and the HUD shows
+# NO BATT instead of numbers (an unconnected power-module input reads ~1-2 V of
+# noise). Set it to about cells x 3.0 V for your pack, e.g. 4S -> 12.0.
+min_valid_v = 6.0
+
+[blackbox]
+enabled = true
+dir = "~/dpv_blackbox"          # one folder per run: mavlink.tlog, hud.csv, events.log
+csv_rate_hz = 5                 # rows per second in hud.csv
+max_total_mb = 2000             # oldest sessions are deleted beyond this
+
 [speed]
 levels = [25, 50, 75, 100]      # percent; SPEED button cycles through these
 default_index = 0

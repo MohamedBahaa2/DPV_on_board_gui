@@ -9,9 +9,13 @@ after RC_OVERRIDE_TIME, and its throttle failsafe takes over (see README).
 """
 from __future__ import annotations
 
+import logging
+
 from PyQt5.QtCore import QObject, QTimer
 
 from .state import UiState
+
+log = logging.getLogger(__name__)
 
 
 class ThrottleSender(QObject):
@@ -22,6 +26,7 @@ class ThrottleSender(QObject):
         self.channel = cfg.get("channel", 3)
         self.neutral = cfg.get("neutral_pwm", 1500)
         self.full = cfg.get("full_pwm", 2000)
+        self.last_pwm: int | None = None  # last value sent (None = not sending); for the blackbox
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(int(1000 / cfg.get("rate_hz", 10)))
@@ -35,5 +40,9 @@ class ThrottleSender(QObject):
         if not self.enabled:
             return
         s = self.link.snapshot()
-        if s.link_ok:
-            self.link.send_throttle(self.pwm_for(s.mode), self.channel)
+        pwm = self.pwm_for(s.mode) if s.link_ok else None
+        if pwm != self.last_pwm:
+            log.info("Throttle override ch%d: %s", self.channel, f"{pwm} us" if pwm else "not sending (no link)")
+            self.last_pwm = pwm
+        if pwm is not None:
+            self.link.send_throttle(pwm, self.channel)

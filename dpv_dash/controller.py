@@ -54,11 +54,13 @@ class Controller(QObject):
 
     # ------------------------------------------------------------ dispatch
     def on_press(self, name: str) -> None:
+        log.info("Button %s pressed", name)
         fn = self.actions.get(name)
         if fn:
             fn()
 
     def on_release(self, name: str) -> None:
+        log.info("Button %s released", name)
         fn = self.release_actions.get(name)
         if fn:
             fn()
@@ -89,6 +91,7 @@ class Controller(QObject):
 
     def toggle_guide(self) -> None:
         self.ui.guide_source = "TARGET" if self.ui.guide_source == "HOME" else "HOME"
+        log.info("Guide source %s", self.ui.guide_source)
 
     # ------------------------------------------------------------ helpers
     def _apply_auto_speed(self) -> None:

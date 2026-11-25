@@ -1,4 +1,4 @@
-"""Entry point: python -m dpv_dash [--sim] [--windowed] [--conn URL] [--test-buttons]"""
+"""Entry point: python -m dpv_dash [--sim] [--windowed] [--conn URL] [--test-buttons] [--check]"""
 from __future__ import annotations
 
 import argparse
@@ -39,6 +39,9 @@ def main() -> int:
     ap.add_argument("--windowed", action="store_true", help="normal window instead of full screen")
     ap.add_argument("--conn", help="override [mavlink] connection, e.g. udpin:0.0.0.0:14550")
     ap.add_argument("--test-buttons", action="store_true", help="print GPIO button edges and exit")
+    ap.add_argument("--check", action="store_true",
+                    help="no HUD; print what the Pixhawk really sends (rates, raw values, params) and exit")
+    ap.add_argument("--seconds", type=float, default=10.0, help="listening time for --check")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -46,6 +49,13 @@ def main() -> int:
                         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
     with open(args.config, "rb") as f:
         cfg = tomllib.load(f)
+
+    if args.check:
+        from .check import run_check
+        mcfg = dict(cfg["mavlink"])
+        if args.conn:
+            mcfg["connection"] = args.conn
+        return run_check(mcfg, args.seconds)
 
     if args.test_buttons:
         from .controls import test_buttons
@@ -56,27 +66,36 @@ def main() -> int:
     from PyQt5.QtCore import QTimer
     from PyQt5.QtWidgets import QApplication
 
+    from .blackbox import Blackbox
     from .controller import Controller
     from .controls import GpioButtons
     from .hud import Hud
     from .throttle import ThrottleSender
 
+    bbcfg = cfg.get("blackbox", {})
+    bb = None
+    if bbcfg.get("enabled", True):
+        try:
+            bb = Blackbox(bbcfg, cfg, sim=args.sim)
+        except OSError as e:  # never let logging stop the dashboard
+            logging.getLogger("dpv_dash").error("Blackbox disabled: %s", e)
+
     if args.sim:
         from .sim import SimLink
-        link = SimLink()
+        link = SimLink(cfg.get("battery", {}))
     else:
         from .mavlink_link import MavlinkLink
         mcfg = dict(cfg["mavlink"])
         if args.conn:
             mcfg["connection"] = args.conn
-        link = MavlinkLink(mcfg)
+        link = MavlinkLink(mcfg, cfg.get("battery", {}), blackbox=bb)
 
     app = QApplication(sys.argv)
     app.setApplicationName("dpv_dash")
     link.start()
 
     ctl = Controller(link, cfg)
-    throttle = ThrottleSender(link, ctl.ui, cfg.get("throttle", {}))  # noqa: F841 (kept alive)
+    throttle = ThrottleSender(link, ctl.ui, cfg.get("throttle", {}))
     buttons = GpioButtons(cfg.get("buttons", {}))
     buttons.pressed.connect(ctl.on_press)
     buttons.released.connect(ctl.on_release)
@@ -95,9 +114,16 @@ def main() -> int:
     tick.timeout.connect(lambda: None)
     tick.start(250)
 
+    if bb is not None:  # record what the driver sees, csv_rate_hz times a second
+        rec = QTimer()
+        rec.timeout.connect(lambda: bb.write_row(link.snapshot(), ctl.ui, throttle.last_pwm))
+        rec.start(int(1000 / bbcfg.get("csv_rate_hz", 5)))
+
     rc = app.exec_()
     buttons.close()
     link.stop()
+    if bb is not None:
+        bb.close()
     return rc
 
 

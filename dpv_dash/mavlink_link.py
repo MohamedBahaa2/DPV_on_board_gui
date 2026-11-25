@@ -3,6 +3,11 @@
 Runs in a background thread. The HUD reads `snapshot()`; the controller calls
 `set_mode()`, `change_speed()`, `send_throttle()`, which are queued and sent
 from the link thread so all serial I/O happens in one place.
+
+Data path:  serial bytes -> pymavlink parser -> _handle() writes raw values into
+VehicleState (+ receive time per message) -> snapshot() copies it and runs
+state.apply_trust(), which blanks anything stale or implausible.
+Every message in and out is also written to the blackbox .tlog.
 """
 from __future__ import annotations
 
@@ -11,13 +16,14 @@ import glob
 import logging
 import os
 import queue
+import struct
 import threading
 import time
 
 os.environ.setdefault("MAVLINK20", "1")  # must be set before importing mavutil
 from pymavlink import mavutil  # noqa: E402
 
-from .state import VehicleState  # noqa: E402
+from .state import VehicleState, apply_trust  # noqa: E402
 
 log = logging.getLogger(__name__)
 mav = mavutil.mavlink
@@ -32,15 +38,24 @@ STREAM_RATES_HZ = {
     "GPS_RAW_INT": 2,
     "MISSION_CURRENT": 1,
     "HOME_POSITION": 0.2,
+    "RC_CHANNELS": 2,          # proves the Pixhawk received our throttle override (blackbox)
+    "SERVO_OUTPUT_RAW": 2,     # ... and what it drove the motor output to
 }
+# Commands whose ACK is worth logging (the stream requests are too chatty).
+LOGGED_CMDS = {mav.MAV_CMD_DO_SET_MODE, mav.MAV_CMD_DO_CHANGE_SPEED, mav.MAV_CMD_COMPONENT_ARM_DISARM}
+FSYNC_EVERY_S = 2.0
 RE_REQUEST_EVERY_S = 10.0  # re-send stream requests (cheap; survives a Pixhawk reboot)
 MISSION_REFRESH_S = 15.0   # re-download the mission (picks up edits from the land station)
 MISSION_ITEM_TIMEOUT_S = 1.0
 
 
 class MavlinkLink:
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, battery_cfg: dict | None = None, blackbox=None):
         self.cfg = cfg
+        self._min_valid_v = (battery_cfg or {}).get("min_valid_v", 6.0)
+        self._bb = blackbox
+        self._tlog = None
+        self._link_up = False
         self._state = VehicleState()
         self._lock = threading.Lock()
         self._cmds: queue.Queue = queue.Queue()
@@ -64,10 +79,23 @@ class MavlinkLink:
         self._thread.join(timeout=2)
 
     def snapshot(self) -> VehicleState:
+        """A trusted copy of the vehicle state (see state.apply_trust)."""
         with self._lock:
             s = copy.copy(self._state)
-        s.link_ok = (time.monotonic() - self._last_hb) < self.cfg.get("link_timeout_s", 2.0)
-        return s
+            s.rx = dict(s.rx)
+        s.link_ok = self._link_alive()
+        return apply_trust(s, self._min_valid_v)
+
+    def _link_alive(self) -> bool:
+        return (time.monotonic() - self._last_hb) < self.cfg.get("link_timeout_s", 2.0)
+
+    def _set_link(self, up: bool, why: str = "") -> None:
+        if up != self._link_up:
+            self._link_up = up
+            if up:
+                log.info("LINK UP")
+            else:
+                log.warning("LINK LOST%s", f" ({why})" if why else "")
 
     def set_mode(self, name: str) -> None:
         self._cmds.put(("mode", name))
@@ -93,7 +121,9 @@ class MavlinkLink:
                 if str(e) != last_err:
                     log.warning("MAVLink link error: %s (retrying)", e)
                     last_err = str(e)
+                self._set_link(False, "port closed")
             finally:
+                self._close_tlog()
                 if self._conn is not None:
                     try:
                         self._conn.close()
@@ -124,12 +154,43 @@ class MavlinkLink:
             autoreconnect=False,
         )
         log.info("Opened %s", self._conn.address)
+        if self._bb is not None:
+            self._tlog = self._bb.open_tlog()
+            if self._tlog is not None:
+                self._conn.logfile = self._tlog                 # received messages
+                self._conn.mav.set_send_callback(self._log_sent)  # sent messages
+
+    # ---------------------------------------------------------------- blackbox
+    def _log_sent(self, msg) -> None:
+        if self._tlog is not None:
+            usec = int(time.time() * 1.0e6) & ~3
+            self._tlog.write(struct.pack(">Q", usec) + msg.get_msgbuf())
+
+    def _sync_tlog(self) -> None:
+        if self._tlog is not None:
+            self._tlog.flush()
+            os.fsync(self._tlog.fileno())
+
+    def _close_tlog(self) -> None:
+        if self._tlog is not None:
+            try:
+                self._sync_tlog()
+                self._tlog.close()
+            except Exception:
+                pass
+            self._tlog = None
 
     def _loop(self) -> None:
         last_req = 0.0
         last_own_hb = 0.0
+        last_sync = time.monotonic()
         while not self._stop.is_set():
             now = time.monotonic()
+            if self._link_up and not self._link_alive():
+                self._set_link(False, "no heartbeat for %.1f s" % self.cfg.get("link_timeout_s", 2.0))
+            if now - last_sync >= FSYNC_EVERY_S:
+                self._sync_tlog()
+                last_sync = now
             if now - last_own_hb >= 1.0:
                 self._conn.mav.heartbeat_send(mav.MAV_TYPE_GCS, mav.MAV_AUTOPILOT_INVALID, 0, 0, 0)
                 last_own_hb = now
@@ -203,12 +264,15 @@ class MavlinkLink:
         t = msg.get_type()
         if t == "BAD_DATA":
             return False
+        if t == "HEARTBEAT" and (msg.autopilot == mav.MAV_AUTOPILOT_INVALID or msg.type == mav.MAV_TYPE_GCS):
+            return False  # another GCS / companion, not the autopilot
+        if t != "HEARTBEAT" and msg.get_srcSystem() != self._target_sys:
+            return False  # only trust data from the autopilot we are locked onto
         new_target = False
         with self._lock:
             s = self._state
+            s.rx[t] = time.monotonic()
             if t == "HEARTBEAT":
-                if msg.autopilot == mav.MAV_AUTOPILOT_INVALID or msg.type == mav.MAV_TYPE_GCS:
-                    return False  # another GCS / companion, not the autopilot
                 if self._target_sys != msg.get_srcSystem():
                     self._target_sys = msg.get_srcSystem()
                     self._target_comp = msg.get_srcComponent()
@@ -217,6 +281,7 @@ class MavlinkLink:
                     new_target = True
                 self._mav_type = msg.type
                 self._last_hb = time.monotonic()
+                self._set_link(True)
                 s.mode = mavutil.mode_string_v10(msg)
                 s.armed = bool(msg.base_mode & mav.MAV_MODE_FLAG_SAFETY_ARMED)
             elif t == "VFR_HUD":
@@ -226,15 +291,20 @@ class MavlinkLink:
             elif t == "ATTITUDE":
                 s.roll, s.pitch = msg.roll, msg.pitch
             elif t == "SYS_STATUS":
+                s.batt_present = bool(msg.onboard_control_sensors_present & mav.MAV_SYS_STATUS_SENSOR_BATTERY)
+                s.ahrs_ok = (bool(msg.onboard_control_sensors_health & mav.MAV_SYS_STATUS_AHRS)
+                             if msg.onboard_control_sensors_present & mav.MAV_SYS_STATUS_AHRS else None)
                 s.batt_voltage = None if msg.voltage_battery in (0, 65535) else msg.voltage_battery / 1000.0
                 s.batt_current = None if msg.current_battery < 0 else msg.current_battery / 100.0
                 s.batt_remaining = None if msg.battery_remaining < 0 else msg.battery_remaining
             elif t == "GPS_RAW_INT":
                 s.gps_fix = msg.fix_type
-                s.gps_sats = 0 if msg.satellites_visible == 255 else msg.satellites_visible
+                s.gps_sats = None if msg.satellites_visible == 255 else msg.satellites_visible
             elif t == "GLOBAL_POSITION_INT":
                 if msg.lat or msg.lon:
                     s.lat, s.lon = msg.lat / 1e7, msg.lon / 1e7
+                else:
+                    s.lat = s.lon = None
             elif t == "HOME_POSITION":
                 if msg.latitude or msg.longitude:
                     s.home_lat, s.home_lon = msg.latitude / 1e7, msg.longitude / 1e7
@@ -252,11 +322,16 @@ class MavlinkLink:
             elif t == "PARAM_VALUE":
                 pid = msg.param_id.rstrip("\x00") if isinstance(msg.param_id, str) else msg.param_id
                 self._params[pid] = msg.param_value
+                if pid == "BATT_MONITOR":
+                    s.batt_monitor = int(msg.param_value)
                 wp, cruise = self._params.get("WP_SPEED"), self._params.get("CRUISE_SPEED")
                 s.cruise_speed = wp if wp else cruise
             elif t == "COMMAND_ACK":
-                if msg.result != mav.MAV_RESULT_ACCEPTED:
-                    name = mav.enums["MAV_CMD"].get(msg.command)
+                name = mav.enums["MAV_CMD"].get(msg.command)
+                if msg.result == mav.MAV_RESULT_ACCEPTED:
+                    if msg.command in LOGGED_CMDS:
+                        log.info("Command %s accepted", name.name if name else msg.command)
+                else:
                     s.statustext = f"REJECTED: {name.name if name else msg.command}"
                     s.statustext_severity = 4
                     s.statustext_time = time.monotonic()
@@ -273,7 +348,7 @@ class MavlinkLink:
             msg_id = getattr(mav, f"MAVLINK_MSG_ID_{name}")
             self._cmd_long(mav.MAV_CMD_SET_MESSAGE_INTERVAL, msg_id, int(1e6 / hz))
         self._cmd_long(mav.MAV_CMD_REQUEST_MESSAGE, mav.MAVLINK_MSG_ID_HOME_POSITION)
-        for p in ("WP_SPEED", "CRUISE_SPEED"):
+        for p in ("WP_SPEED", "CRUISE_SPEED", "BATT_MONITOR"):
             self._conn.mav.param_request_read_send(self._target_sys, self._target_comp, p.encode(), -1)
 
     def _drain_commands(self) -> None:
@@ -296,6 +371,7 @@ class MavlinkLink:
                 log.info("Change speed %.2f m/s", arg)
                 self._cmd_long(mav.MAV_CMD_DO_CHANGE_SPEED, 1, arg, -1)
             elif kind == "arm":
+                log.info("%s request", "Arm" if arg else "Disarm")
                 self._cmd_long(mav.MAV_CMD_COMPONENT_ARM_DISARM, 1 if arg else 0)
             elif kind == "rc":
                 pwm, ch = arg
