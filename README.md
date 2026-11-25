@@ -23,6 +23,9 @@ A heads-up-display style dashboard for the DPV driver. It runs on a Raspberry Pi
 - **`controls.py`** turns GPIO button edges into `pressed`/`released` events. **`controller.py`** decides what each button does.
 - **`throttle.py`** acts as the vehicle's "RC transmitter" for the throttle channel (see §5).
 - **`sim.py`** is a fake vehicle with the same interface as the real link. It lets you work on the HUD with no Pixhawk attached.
+- **`blackbox.py`** records every run: all MAVLink traffic, what the HUD showed and what the driver pressed (see §10).
+
+Section §9 describes every file in detail.
 
 ## 2. Hardware and wiring
 
@@ -36,6 +39,7 @@ A heads-up-display style dashboard for the DPV driver. It runs on a Raspberry Pi
 **Pixhawk → Pi over USB.** The Pixhawk appears as `/dev/ttyACM0`. `config.toml` tries the stable name `/dev/serial/by-id/usb-…-if00` first, so the right port is found even if other USB serial devices are plugged in. To see the board's exact name, run `ls /dev/serial/by-id/` with it connected.
 
 - Power the Pixhawk from its own power module. USB power from the Pi is fine on the bench but not for driving.
+- The Pi 5 needs a proper **5 V / 5 A** supply. If `vcgencmd get_throttled` shows anything other than `0x0`, the Pi has been undervolted. On the bench it showed `0x50005` at 4.8 V while it also powered the Pixhawk. Undervoltage can reset the USB port, and the HUD then shows NO LINK.
 - Use a short, good-quality cable, and strain-relieve it: if the cable comes loose, the motor stops (see §5).
 
 **Buttons** (BCM numbers, set in `config.toml`)
@@ -48,22 +52,36 @@ A heads-up-display style dashboard for the DPV driver. It runs on a Raspberry Pi
 | GUIDE | 19 | 35 |
 | Ground | – | 30, 34 or 39 |
 
-By default each input uses the Pi's internal pull-up and counts as "pressed" when the sensor pulls it **low**. That suits open-drain hall switches such as the US5881 or A3144. If your sensor drives its output high instead, set `active_high = true`. ⚠️ **A GPIO pin must never see more than 3.3 V.** Power the sensors from 3.3 V, or make sure the output is open-drain.
+**Wiring the A3144E hall switches.** Hold the sensor with the printed (bevelled) face toward you and the legs pointing down. From left to right the legs are **1 = VCC, 2 = GND, 3 = OUT**.
+
+| A3144 leg | Connect to |
+|---|---|
+| 1 VCC | Pi **5 V** (pin 2 or 4). The A3144 needs **4.5–24 V**, so 3.3 V is out of spec. |
+| 2 GND | Pi GND (pin 30, 34 or 39) |
+| 3 OUT | The button's GPIO (table above), **plus a 10 kΩ resistor from OUT to 3.3 V** (pin 1 or 17) |
+
+Add a 100 nF capacitor across VCC–GND, close to each sensor.
+
+- OUT is **open-collector**. It can only pull the line down to GND and never drives it up, so a 5 V supply is safe as long as the pull-up goes to **3.3 V**. ⚠️ **Never pull OUT up to 5 V. A GPIO pin must never see more than 3.3 V.** The Pi's internal pull-up (~50 kΩ, enabled by the app) works on the bench, but the external 10 kΩ makes the line much less sensitive to motor noise.
+- The A3144 is **unipolar**. It switches on only when a magnet's **south pole** faces the printed side, and switches off again when the magnet moves away. If a button doesn't react, turn the magnet over.
+- It is **fail-safe**. A broken wire or an unpowered sensor leaves the line high, which reads as "released", so a cut TRIGGER wire stops the motor. Only a short from OUT to GND reads as "pressed".
+- `active_high = false` (the default) is correct for the A3144.
 
 ## 3. Reading the HUD
 
 | Where | What |
 |---|---|
-| **Top: heading tape** | A compass ribbon. The box shows the current heading. The **bug** on the tape marks the bearing to the selected guidance target. When the target is off the tape, an arrow at the edge points toward it. |
-| **Left: speed tape** | Ground speed (knots by default). In AUTO/RTL a magenta bug marks the commanded speed. |
-| **Right: battery** | Remaining %, voltage and current. Green above 40 %, amber above 20 %, **red and flashing** at 20 % or less. |
+| **Top: heading tape** | A compass ribbon. The box shows the current heading. It turns **amber** with **TILT** when roll or pitch exceeds 70° (a compass heading is meaningless near vertical), or with **AHRS** when the autopilot reports its attitude estimate as unhealthy. The **bug** on the tape marks the bearing to the selected guidance target. When the target is off the tape, an arrow at the edge points toward it. |
+| **Left: speed tape** | Ground speed (knots by default). In AUTO/RTL a magenta bug marks the commanded speed. Shows `--.-` / NEEDS GPS without a 3D GPS fix, because without GPS the number would be an estimate, not a measurement. |
+| **Right: battery** | Remaining %, voltage and current. Green above 40 %, amber above 20 %, **red and flashing** at 20 % or less. **NO BATT**: a monitor is configured but the voltage is below `[battery] min_valid_v`, so nothing (real) is connected. **NO MON**: no battery monitor (`BATT_MONITOR = 0`). Note that ArduPilot does not *measure* the %. It counts down from `BATT_CAPACITY` starting at FC power-up, so plug in a full pack before powering the Pixhawk. |
 | **Centre: steering cue** | Chevrons point the way to turn, and the number is the error in degrees. 1 chevron means under 20°, 2 means under 60°, 3 means 60° or more. Within 5° it shows **ON COURSE**; within 3 m of the target it shows **AT HOME** / **AT WP n**. |
 | **Centre: guidance box** | The selected target (**HOME** in cyan, or **WP n** in magenta) with its bearing, distance, coordinates and ETA. The HOME/WP tabs show which target is selected. |
 | Under the heading tape | The latest message from the autopilot (shown for 10 s). Red = error, amber = warning. |
 | **Bottom: MODE** | The current mode. A mode that is selected but not yet sent flashes amber (see §4). |
 | **Bottom: SPEED SET** | The selected speed level. In AUTO/RTL it also shows the speed this works out to. |
 | **Bottom: MOTOR / THR / GPS / LINK** | Armed state, actual throttle output (lit green while the trigger is held), GPS fix and satellite count, and the link to the Pixhawk. |
-| **NO LINK** banner | No heartbeat from the Pixhawk for 2 s. Readings are blanked rather than left showing stale values. |
+| **NO LINK** banner | No heartbeat from the Pixhawk for 2 s. All readings are blanked (dashes) rather than left showing stale values. |
+| Grey dashes anywhere | That value is **unknown right now**: not received yet, not refreshed recently, or physically implausible. The HUD never shows a default or a remembered value as if it were live (see "Trust rules" in §9). |
 
 Colours follow cockpit convention: green = normal, cyan = home and selections, magenta = active route, amber = caution, red = warning.
 
@@ -97,11 +115,14 @@ If the app crashes, the Pi freezes or the cable comes off, the overrides stop. A
 |---|---|---|
 | `SERIAL0_PROTOCOL` | 2 | MAVLink2 on USB (this is the default) |
 | `SYSID_MYGCS` (called `MAV_GCS_SYSID` on newer firmware) | 255 | ArduPilot only accepts RC overrides from this system ID; the Pi uses 255. If the land station also sends joystick overrides, give one of them a different ID. |
-| `RC_OVERRIDE_TIME` | 0.5 | Overrides expire 0.5 s after the last message |
+| `RC_OVERRIDE_TIME` | 0.5 | Overrides expire 0.5 s after the last message. ⚠️ On the bench Pixhawk this was **3**, which means the motor would keep its last throttle for 3 s after the Pi dies. `--check` flags it. |
 | `FS_THR_ENABLE` | 1 | Enable the radio/throttle failsafe |
 | `FS_ACTION` | 2 | Failsafe action = Hold (stop) |
 | `RCMAP_THROTTLE` | 3 | Throttle is RC channel 3 (`[throttle] channel`) |
 | `WP_SPEED` | your cruise speed | 100 % speed level in AUTO/RTL |
+| `BATT_MONITOR`, `BATT_CAPACITY` | 4, your pack's mAh | Power-module voltage/current; % is counted down from the capacity |
+
+Run `.venv/bin/python -m dpv_dash --check` (§8) to read all of these from the Pixhawk and compare them with this table.
 
 Arming is done from the land station for now. Check that the pre-arm checks pass while the Pi is connected, since its overrides count as the RC input.
 
@@ -166,6 +187,9 @@ Useful options (they work in both modes):
 | `--conn URL` | Use a different MAVLink connection, e.g. `--conn /dev/ttyACM1`, or `--conn udpin:0.0.0.0:14550` for ArduPilot SITL on a laptop |
 | `-v` | Verbose logging |
 | `--test-buttons` | No HUD; prints every hall-button press and release, to check the wiring |
+| `--check [--seconds N]` | No HUD. Talks to the Pixhawk with plain pymavlink, bypassing the app's parsing, and prints message rates, the raw value behind every HUD field, sensor health and the §6 parameters, with plain-language verdicts. Stop the dashboard first: only one program can open the serial port. |
+
+> The stop command in Step 1 is meant to be typed in an interactive terminal. Inside a script or `bash -c "…"`, `pkill -f` also matches that shell's own command line and kills it. There, look up the PID with `pgrep -af dpv_dash` and `kill` it instead.
 
 ### Step 3: drive it
 
@@ -189,28 +213,89 @@ Reboot, or start the autostart launcher again. The launcher always runs operatio
 nohup scripts/run.sh >/dev/null 2>&1 &
 ```
 
-## 9. Development
+## 9. Project architecture
 
-To take a screenshot of the LCD over SSH: `XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 grim shot.png`. The log of the autostarted dashboard is at `~/.local/state/dpv_dash.log`.
+### 9.1 Threads and data flow
 
-**`config.toml`**: the Pixhawk device (a path, glob or list), button pins and polarity, speed levels, throttle channel and PWM range, the mode cycle and its commit delay, and the speed units (`kn`, `m/s` or `km/h`).
+The app runs on three kinds of thread. Each piece of data has exactly one writer.
 
 ```
-dpv_dash/
-  __main__.py      entry point, wires everything together
-  state.py         VehicleState (telemetry) + UiState (driver selections) + nav maths
-  mavlink_link.py  Pixhawk link thread: streams, mission download, commands
-  controller.py    button → action table
-  controls.py      GPIO hall buttons (gpiozero)
-  throttle.py      dead-man trigger → RC throttle override
-  hud.py           all drawing
-  sim.py           fake vehicle
-scripts/run.sh       autostart launcher with restart loop
-scripts/setup_pi.sh  one-time OS setup (screen blanking, dialout group)
-deploy/              autostart .desktop entry
+ Pixhawk ═USB═▶ [link thread · mavlink_link.py]
+   ▲              bytes ─▶ pymavlink parser (CRC check) ─▶ _handle(msg) ─▶ raw VehicleState
+   │              every message in + out ─▶ blackbox mavlink.tlog
+   │                                    │
+   │                                    │ snapshot(): copy under lock + state.apply_trust()
+   │                                    ▼
+   │            [Qt main thread]   trusted VehicleState
+   │                                    ├─▶ hud.py ........ paints 30×/s ─▶ HDMI ─▶ 5" LCD
+   ├── RC override (PWM) ◀── 10×/s ─────├─▶ throttle.py
+   ├── set mode / change speed ◀────────├─▶ controller.py ─▶ UiState (speed, mode, guide, trigger)
+   │                                    └─▶ blackbox.py ... hud.csv 5×/s, events.log
+   │                                                 ▲
+   └── heartbeat 1×/s (from link thread)             │ Qt signal pressed/released(name)
+                                                     │
+ Hall buttons ─GPIO 5/6/13/19─▶ [gpiozero callback threads · controls.py]
 ```
 
-## 10. Adding a button
+How one value travels. Take the heading:
+1. The Pixhawk sends `VFR_HUD` at 10 Hz, because the app asked for that rate with `MAV_CMD_SET_MESSAGE_INTERVAL`.
+2. pymavlink checks the packet's CRC and decodes it in the link thread. The raw packet is also appended to `mavlink.tlog`.
+3. `MavlinkLink._handle()` accepts it only if it came from the autopilot's system ID. It stores `heading` and the receive time `rx["VFR_HUD"]`.
+4. 30 times a second the HUD calls `snapshot()`. That copies the state under a lock and runs `apply_trust()`, which sets `heading = None` if no `VFR_HUD` arrived in the last 1 s.
+5. `hud.py` draws the number, or `---°` for `None`. `blackbox.py` writes the same trusted value to `hud.csv`.
+
+**Trust rules** (`state.apply_trust`). A value is shown only when it is fresh *and* plausible. Anything else becomes `None`, which is drawn as grey dashes:
+
+| Value | Shown only if… |
+|---|---|
+| everything | the link is up (a heartbeat within `link_timeout_s`) |
+| speed, heading, throttle | `VFR_HUD` arrived within 1 s; speed also needs a 3D GPS fix |
+| roll, pitch (horizon) | `ATTITUDE` arrived within 1 s |
+| position | `GLOBAL_POSITION_INT` arrived within 2 s and there is a 3D GPS fix |
+| GPS fix / satellites | `GPS_RAW_INT` arrived within 3 s |
+| battery V / A / % | `SYS_STATUS` arrived within 3 s, a monitor is configured, and voltage ≥ `[battery] min_valid_v` |
+
+### 9.2 What each file is
+
+| File | What it is / represents | Inputs → outputs | Runs on |
+|---|---|---|---|
+| `dpv_dash/__main__.py` | **Entry point.** Parses the command line, loads `config.toml`, creates every part below and connects them, starts Qt. Also runs the `--check` and `--test-buttons` tools. | args + config → running app | main thread |
+| `dpv_dash/state.py` | **The data model.** `VehicleState` = what the vehicle reported (telemetry). `UiState` = what the driver has selected (speed level, pending mode, guide source, trigger). `apply_trust()` = the trust rules above. Also the navigation maths (bearing/distance). | — | shared |
+| `dpv_dash/mavlink_link.py` | **The Pixhawk link.** Opens the serial port, sends our heartbeat, asks for message streams, downloads the mission, decodes incoming messages into `VehicleState`, and sends queued commands (set mode, change speed, RC override). Reconnects automatically. Attaches the blackbox `.tlog`. | serial bytes ⇄ `VehicleState` + command queue | link thread |
+| `dpv_dash/controls.py` | **The physical buttons.** Turns GPIO edges from the hall sensors into `pressed(name)` / `released(name)` Qt signals. | GPIO pins → Qt signals | gpiozero threads |
+| `dpv_dash/controller.py` | **What the buttons mean.** MODE (with a 1.5 s commit delay), SPEED level, TRIGGER, GUIDE. Re-applies the AUTO/RTL speed whenever the mode changes. Logs every press. | button names → `UiState` changes + link commands | main thread |
+| `dpv_dash/throttle.py` | **The virtual RC transmitter** for the throttle channel. Sends `RC_CHANNELS_OVERRIDE` 10×/s: neutral, or level % while the trigger is held in MANUAL. Remembers `last_pwm` for the blackbox. | `UiState` + mode → PWM to link | main thread |
+| `dpv_dash/hud.py` | **The screen.** Paints the whole 800×480 HUD from one trusted snapshot, 30×/s. Keyboard fallback for desk tests. | trusted `VehicleState` + `UiState` → pixels | main thread |
+| `dpv_dash/blackbox.py` | **The flight recorder.** One folder per run with `mavlink.tlog`, `hud.csv`, `events.log`, `meta.json`. Retention by total size. | messages, snapshots, log lines → files | link + main thread |
+| `dpv_dash/check.py` | **Independent link check** (`--check`). Plain pymavlink, without the app's own parsing, to verify what the HUD shows. | Pixhawk → terminal report | standalone |
+| `dpv_dash/sim.py` | **Fake vehicle** with the same interface as `MavlinkLink`, run through the same trust rules. | throttle/mode commands → simulated state | sim thread |
+| `config.toml` | **All settings**: Pixhawk port, button pins/polarity, battery plausibility, blackbox, speed levels, throttle PWM, mode cycle, units. | — | read at start |
+| `scripts/run.sh` | **Autostart launcher.** Runs the app full-screen and restarts it 2 s after a crash. Logs to `~/.local/state/dpv_dash.log`. | — | shell |
+| `scripts/setup_pi.sh` | **One-time OS setup**: disables screen blanking, checks the `dialout` group. | — | run once with sudo |
+| `deploy/dpv-dash.desktop` | **Autostart entry** for the desktop session; it starts `scripts/run.sh` at login. | — | copied to `~/.config/autostart/` |
+| `docs/hud.png` | Screenshot used at the top of this README. | — | — |
+| `~/dpv_blackbox/` | **Recorded runs** (not in the project folder). See §10. | — | — |
+
+### 9.3 Development
+
+To take a screenshot of the LCD over SSH: `XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 grim shot.png`. The autostarted dashboard logs to `~/.local/state/dpv_dash.log`.
+
+## 10. Blackbox
+
+Every start of the app creates `~/dpv_blackbox/<seq>_<date-time>/` (`_sim` is appended in sim mode). The sequence number keeps runs in order even when the Pi boots before its clock has been corrected by NTP: without internet the clock can be off by an hour or more. `meta.json` records whether the clock was synced.
+
+| File | Contents | How to read it |
+|---|---|---|
+| `mavlink.tlog` | Every MAVLink message **received from** (sysid 1) and **sent to** (sysid 255) the Pixhawk, timestamped. Includes `RC_CHANNELS` / `SERVO_OUTPUT_RAW`, which show that the override arrived and what the motor output did. | Mission Planner / QGC (replay), MAVExplorer (graphs), or `.venv/bin/mavlogdump.py --types VFR_HUD,RC_CHANNELS mavlink.tlog` |
+| `hud.csv` | 5 rows/s of exactly what the driver saw (empty cell = shown as dashes), plus speed level, pending mode, guide source, trigger and the throttle PWM sent | Any spreadsheet |
+| `events.log` | Link up/lost, button presses/releases, mode and speed commands with the Pixhawk's accept/reject, throttle changes, autopilot messages | Any text editor |
+| `meta.json` | Start time, clock-synced flag, boot ID, full config | Text editor |
+
+- Files are flushed to the SD card every 2 s, so a sudden power cut loses at most about 2 s.
+- About 9 MB per hour. The oldest runs are deleted when the total passes `[blackbox] max_total_mb` (2000 MB by default).
+- This complements the Pixhawk's own **dataflash log** on its SD card, which records the autopilot's internals at high rate. The Pi's blackbox adds what the driver saw and did.
+
+## 11. Adding a button
 
 1. Wire it and add a pin under `[buttons]` in `config.toml`, then add its name to `BUTTON_NAMES` in `dpv_dash/controls.py`.
 2. Write the action as a method in `dpv_dash/controller.py` and register it in `self.actions` (on press) or `self.release_actions` (on release).
